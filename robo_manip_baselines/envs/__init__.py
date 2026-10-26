@@ -155,3 +155,10 @@ register(
     id="robo_manip_baselines/RealXarm7DualDemoEnv-v0",
     entry_point="robo_manip_baselines.envs.real.xarm7_dual:RealXarm7DualDemoEnv",
 )
+
+
+# Real dual FAIRINO FR5 (ROS 2, shadow mode)
+register(
+    id="robo_manip_baselines/RealDualFR5Env-v0",
+    entry_point="robo_manip_baselines.envs.real.fr5_dual:RealDualFR5Env",
+)
