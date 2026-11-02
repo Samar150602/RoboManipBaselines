@@ -18,6 +18,8 @@ Safety:
 """
 
 import argparse
+import csv
+import datetime
 import os
 import pickle
 import sys
@@ -198,6 +200,50 @@ def prepare_images(info, meta, device):
 
     return image_tensor
 
+def evaluate_act_prediction(current_joints, predicted_joints):
+    """
+    Compare ACT output against real robot joint positions.
+
+    Both inputs must contain 12 joint positions in radians.
+    No robot movement is commanded.
+    """
+
+    current = np.asarray(current_joints, dtype=np.float64)
+    predicted = np.asarray(predicted_joints, dtype=np.float64)
+
+    if current.shape != (12,) or predicted.shape != (12,):
+        raise ValueError("Expected 12 joint positions")
+
+    if not np.all(np.isfinite(current)):
+        raise ValueError("Invalid current joint positions")
+
+    if not np.all(np.isfinite(predicted)):
+        raise ValueError("Invalid ACT prediction")
+
+    current_deg = np.rad2deg(current)
+    predicted_deg = np.rad2deg(predicted)
+
+    displacement_deg = predicted_deg - current_deg
+
+    print("\n========== ACT PREDICTION ANALYSIS ==========")
+
+    for i in range(12):
+        robot = 1 if i < 6 else 2
+        joint = (i % 6) + 1
+
+        print(
+            f"FR5-{robot} J{joint}: "
+            f"Current={current_deg[i]:8.3f}° "
+            f"ACT={predicted_deg[i]:8.3f}° "
+            f"Delta={displacement_deg[i]:+8.3f}°"
+        )
+
+    max_displacement = float(np.max(np.abs(displacement_deg)))
+    print(f"Maximum absolute joint displacement: {max_displacement:.3f}°")
+    print(f"FR5 #1 maximum: {np.max(np.abs(displacement_deg[:6])):.3f}°")
+    print(f"FR5 #2 maximum: {np.max(np.abs(displacement_deg[6:])):.3f}°")
+    return displacement_deg
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -220,6 +266,12 @@ def main():
         default="cuda",
     )
 
+    parser.add_argument(
+        "--csv",
+        default=None,
+        help="Output CSV path (default: timestamped file in current directory)",
+    )
+
     args = parser.parse_args()
 
     if args.steps < 1:
@@ -237,9 +289,22 @@ def main():
         device,
     )
 
+    csv_path = args.csv or (
+        "act_shadow_analysis_"
+        + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        + ".csv"
+    )
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+    header = ["step", "chunk_index", "inference_ms", "max_delta_deg"]
+    for prefix in ("current_deg", "act_deg", "delta_deg"):
+        header += [f"{prefix}_fr{robot}_j{joint}" for robot in (1, 2) for joint in range(1, 7)]
+
     env = gym.make(ENV_ID)
 
-    try:
+    with open(csv_path, "w", newline="") as csvfile:
+      writer = csv.writer(csvfile)
+      writer.writerow(header)
+      try:
         obs, info = env.reset()
 
         print("\n========== SHADOW INFERENCE ==========")
@@ -299,6 +364,11 @@ def main():
                     f"time={inference_ms:.1f} ms"
                 )
 
+            # Read the observation for this step, even when reusing an ACT chunk.
+            current_joints = np.asarray(obs["joint_pos"], dtype=np.float64).reshape(-1).copy()
+            if current_joints.shape != (12,) or not np.all(np.isfinite(current_joints)):
+                raise ValueError("Invalid current robot observation")
+
             # Use successive predictions from the current chunk.
             chunk_index = step % skip
 
@@ -345,6 +415,18 @@ def main():
                 np.round(predicted_action[6:], 4),
             )
 
+            delta_deg = evaluate_act_prediction(
+                current_joints, predicted_action
+            )
+            writer.writerow(
+                [step + 1, chunk_index, round(inference_ms, 3) if step % skip == 0 else "",
+                 float(np.max(np.abs(delta_deg)))]
+                + np.rad2deg(current_joints).tolist()
+                + np.rad2deg(predicted_action).tolist()
+                + delta_deg.tolist()
+            )
+            csvfile.flush()
+
             # CRITICAL:
             # Do not pass predicted_action to env.step().
             # Advance observations using current joint positions only.
@@ -368,9 +450,10 @@ def main():
 
         print("\n========== ACT SHADOW TEST PASSED ==========")
         print("No ACT predictions were sent to the robots.")
+        print(f"CSV saved: {os.path.abspath(csv_path)}")
 
-    finally:
-        env.close()
+      finally:
+          env.close()
 
 
 if __name__ == "__main__":
