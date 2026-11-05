@@ -16,11 +16,11 @@ sys.path.insert(0, str(SDK_ROOT))
 from fairino_ctrl.fairino_python_sdk import Robot
 
 
-ROBOT_IP = "192.168.58.2"
+ROBOT_IP = "192.168.58.3"
 
 SERVO_DT = 0.008
 TEST_DURATION = 2
-MOVE_DEG =
+MOVE_DEG = 1.0
 
 
 def checked_call(robot, name):
