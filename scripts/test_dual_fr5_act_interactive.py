@@ -308,24 +308,68 @@ def main():
             current_deg = np.rad2deg(current_joints)
             predicted_deg = np.rad2deg(prediction)
             delta_deg = predicted_deg - current_deg
-            delta_j1 = float(delta_deg[0])
+            # delta_j1 = float(delta_deg[0])
 
-            print(f"\n=== ACT STEP {step+1}/{args.steps} | inference {inference_ms:.1f} ms ===")
-            print("FR5 #1 current (deg):", np.round(current_deg[:6], 3))
-            print("FR5 #1 ACT     (deg):", np.round(predicted_deg[:6], 3))
-            print("FR5 #1 delta   (deg):", np.round(delta_deg[:6], 3))
-            print("FR5 #2 max predicted delta (deg):", round(float(np.max(np.abs(delta_deg[6:]))), 3))
+            # print(f"\n=== ACT STEP {step+1}/{args.steps} | inference {inference_ms:.1f} ms ===")
+            # print("FR5 #1 current (deg):", np.round(current_deg[:6], 3))
+            # print("FR5 #1 ACT     (deg):", np.round(predicted_deg[:6], 3))
+            # print("FR5 #1 delta   (deg):", np.round(delta_deg[:6], 3))
+            # print("FR5 #2 max predicted delta (deg):", round(float(np.max(np.abs(delta_deg[6:]))), 3))
 
-            eligible = np.isfinite(delta_j1) and delta_j1 >= 0.05
-            step_deg = min(delta_j1, 0.5) if eligible else 0.0
-            target_deg = current_deg[:6].copy()
-            target_deg[0] += step_deg
-            print(f"Proposed: J1 +{step_deg:.3f} deg at 5% (other joints unchanged)")
+            # eligible = np.isfinite(delta_j1) and delta_j1 >= 0.05
+            # step_deg = min(delta_j1, 0.5) if eligible else 0.0
+            # target_deg = current_deg[:6].copy()
+            # target_deg[0] += step_deg
+            # print(f"Proposed: J1 +{step_deg:.3f} deg at 5% (other joints unchanged)")
+
+            current_fr1 = current_deg[6:].copy()
+            predicted_fr1 = predicted_deg[6:].copy()
+
+            delta_fr1 = predicted_fr1 - current_fr1
+
+            # safety limit during testing
+            MAX_DELTA_DEG = 3.0
+
+            bounded_delta = np.clip(
+                delta_fr1,
+                -MAX_DELTA_DEG,
+                MAX_DELTA_DEG
+            )
+
+            target_deg = current_fr1 + bounded_delta
+
+            print(f"\n=== ACT STEP {step+1}/{args.steps}======")
+            print()
+            print(
+                f"{'Joint':<8}"
+                f"{'Current':>12}"
+                f"{'ACT target':>14}"
+                f"{'ACT delta':>12}"
+                f"{'Proposed':>12}"
+            )
+
+            for j in range(6):
+                print(
+                    f"J{j+1:<7}"
+                    f"{current_fr1[j]:>12.3f}"
+                    f"{predicted_fr1[j]:>14.3f}"
+                    f"{delta_fr1[j]:>+12.3f}"
+                    f"{bounded_delta[j]:>+12.3f}"
+                )
+
+            print("\nFull ACT target:", np.round(predicted_fr1, 3))
+            print("Proposed target:", np.round(target_deg, 3))
+            print("Velocity: 5%")
+
+            eligible = (
+                np.all(np.isfinite(target_deg))
+                and np.any(np.abs(bounded_delta) >= 0.05)
+            )
 
             if hardware_used:
                 print("Hardware one-shot already used: preview only.")
             elif not eligible:
-                print("Prediction not eligible for positive J1-only hardware test.")
+                print("Prediction not eligible for positive hardware test.")
 
             choice = input("PREVIEW again [ENTER], MOVE once [MOVE], or exit [QUIT]: ").strip().upper()
             if choice == "QUIT":
@@ -343,10 +387,10 @@ def main():
                             "velocity_percent": 5.0,
                         })
                         # One request maximum even if command outcome is unknown.
-                        hardware_used = True
+                        # hardware_used = True
                         try:
                             out = subprocess.run(
-                                ["ros2", "service", "call", "/fairino/move_j",
+                                ["ros2", "service", "call", "/fairino_2/move_j",
                                  "fairino_ctrl_msgs/srv/MoveJ", request],
                                 text=True, capture_output=True, timeout=90,
                             )

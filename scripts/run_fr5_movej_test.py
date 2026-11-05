@@ -27,7 +27,7 @@ class MoveJTest(Node):
 
         self.client = self.create_client(
             MoveJ,
-            "/fairino_1/move_j",
+            "/fairino/move_j",
         )
 
     def joint_callback(self, msg):
@@ -67,14 +67,15 @@ def main():
 
     target = current.copy()
 
+    change = 7
     # First hardware test: +0.5 degrees on J1.
-    target[0] += 0.5
+    target[0] += change
 
     print("\n========== FIRST FR5 MOVEJ TEST ==========")
 
     print("Current joints:", current)
     print("Target joints: ", target)
-    print("Movement: J1 +0.5 degrees")
+    print(f"Movement: J1 +{change} degrees")
     print("Speed: 5%")
 
     if not node.client.wait_for_service(timeout_sec=5.0):
@@ -105,7 +106,7 @@ def main():
         rclpy.spin_once(node, timeout_sec=0.05)
 
     target = list(node.joints)
-    target[0] += 0.5
+    target[0] += change
 
     request = MoveJ.Request()
     request.joint_positions_deg = target
