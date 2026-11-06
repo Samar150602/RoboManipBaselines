@@ -282,8 +282,30 @@ def main():
             q_target = np.rad2deg(action)
             delta = q_target - q_current
             print(f'step={step+1:03d} FR1={np.round(delta[:6], 2)} FR2={np.round(delta[6:], 2)}', flush=True)
-            if np.max(np.abs(delta)) > 12.0:
-                raise RuntimeError('ACT target jumps >12deg from observed joints: abort')
+            max_error = float(np.max(np.abs(delta)))
+            worst_joint = int(np.argmax(np.abs(delta)))
+    
+            robot = 1 if worst_joint < 6 else 2
+            joint = (worst_joint % 6) + 1
+            if max_error > 12.0:
+                print("\n==========ACT diagnostic===========")
+                print(f"ACT step: {step + 1}")
+                print(f"Chunk action: {index + 1}/{chunk_len}")
+    
+                print(f"Robot: FR5#{robot}")
+                print(f"Joint: J{joint}")
+    
+                print(f"Measured joint: {q_current[worst_joint]:.3f} deg")
+                print(f"ACT target: : {q_target[worst_joint]:.3f} deg")
+                print(f"Difference: {delta[worst_joint]:+.3f} deg")
+    
+                print(f"fr1 diff", np.round(delta[:6], 2))
+                print(f"fr2 diff", np.round(delta[6:], 2))
+                print("\n=========================")
+    
+                raise RuntimeError(
+                    "ACT target exceeds validated displacement limit"
+                )
             node.send_targets(action)
             deadline_tick = next_tick + period
             while time.monotonic() < deadline_tick:

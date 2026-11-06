@@ -13,7 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
-SDK_ROOT = Path.home() / 'Downloads/ros2_ws_260827/src/fairino_ctrl/fairino_ctrl'
+SDK_ROOT = Path.home() / 'ros2_ws/src/fairino_ctrl/fairino_ctrl'
 sys.path.insert(0, str(SDK_ROOT))
 from fairino_ctrl.fairino_python_sdk import Robot
 
