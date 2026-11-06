@@ -258,6 +258,9 @@ def main():
         else:
             raise RuntimeError(f'No ARM acknowledgment from both bridges: {node.statuses}')
         period = 1.0 / args.hz
+        # Both arms must reach each ACT waypoint before advancing.
+        REACH_TOL_DEG = 0.75
+        WAYPOINT_TIMEOUT_S = 3.0
         started = time.monotonic()
         next_tick = started
         action_chunk = fresh_chunk
@@ -306,19 +309,90 @@ def main():
                 raise RuntimeError(
                     "ACT target exceeds validated displacement limit"
                 )
+            # =====================================================
+            # SYNCHRONIZED DUAL-ARM ACT WAYPOINT EXECUTION
+            # =====================================================
+
             node.send_targets(action)
-            deadline_tick = next_tick + period
-            while time.monotonic() < deadline_tick:
-                rclpy.spin_once(node, timeout_sec=min(0.008, max(0, deadline_tick - time.monotonic())))
-                if any((node.statuses[a] or {}).get('state') in ('fault', 'disabled', 'stopped') for a in ('fr1', 'fr2')):
-                    raise RuntimeError(f'Servo bridge stopped unexpectedly: {node.statuses}')
-            next_tick = deadline_tick
-            # Do not publish bursts to catch up. If inference is slow, the
-            # next tick starts from the present time, while the controller's
-            # independent target-age watchdog still enforces freshness.
-            if time.monotonic() > next_tick:
-                print(f'[TIMING] ACT behind desired {args.hz:.1f} Hz; running at measured rate', flush=True)
-                next_tick = time.monotonic()
+
+            waypoint_start = time.monotonic()
+            last_publish = waypoint_start
+            session_timed_out = False
+
+            while rclpy.ok():
+
+                # Process feedback from BOTH robots.
+                rclpy.spin_once(node, timeout_sec=0.01)
+
+                now = time.monotonic()
+
+                # Preserve the session duration limit.
+                if now - started >= args.max_duration:
+                    print("ACT session duration reached")
+                    session_timed_out = True
+                    break
+
+                # Stop if either ServoJ controller reports a problem.
+                for arm in ("fr1", "fr2"):
+                    status = node.statuses[arm] or {}
+
+                    if status.get("state") in (
+                        "fault", "disabled", "stopping", "stopped"
+                    ):
+                        raise RuntimeError(
+                            f"{arm} ServoJ stopped: {status}"
+                        )
+
+                # Require recent feedback from BOTH arms.
+                for arm in ("fr1", "fr2"):
+                    age = now - node.arrivals.get(arm, 0.0)
+
+                    if age > 0.30:
+                        raise RuntimeError(
+                            f"{arm} joint feedback stale: {age:.3f}s"
+                        )
+
+                # Current measured joint positions, in degrees.
+                measured = np.rad2deg(
+                    np.concatenate((
+                        node.data["fr1"],
+                        node.data["fr2"],
+                    ))
+                )
+
+                error = q_target - measured
+
+                fr1_error = np.max(np.abs(error[:6]))
+                fr2_error = np.max(np.abs(error[6:]))
+
+                # Only advance when BOTH robots reached the waypoint.
+                if (
+                    fr1_error <= REACH_TOL_DEG
+                    and fr2_error <= REACH_TOL_DEG
+                ):
+                    print(
+                        f"Waypoint {step + 1} reached: "
+                        f"FR1 error={fr1_error:.3f}°, "
+                        f"FR2 error={fr2_error:.3f}°"
+                    )
+                    break
+
+                # Keep sending the SAME target so the bridge's
+                # existing command watchdog does not expire.
+                if now - last_publish >= period:
+                    node.send_targets(action)
+                    last_publish = now
+
+                # Never skip a waypoint because of timeout.
+                if now - waypoint_start >= WAYPOINT_TIMEOUT_S:
+                    raise RuntimeError(
+                        f"Waypoint {step + 1} timeout: "
+                        f"FR1 error={fr1_error:.2f}°, "
+                        f"FR2 error={fr2_error:.2f}°"
+                    )
+
+            if session_timed_out:
+                break
         print('ACT bounded session finished; requesting servo end.')
     finally:
         if armed:
