@@ -194,7 +194,32 @@ class Observations(Node):
             snap = self.snapshot(since=since)
             if snap is not None:
                 return snap
-        raise RuntimeError('No new, suitably synchronized camera + joint observations')
+        now = time.monotonic()
+
+        print("\n========== OBSERVATION DIAGNOSTICS ==========")
+
+        print("Received sources:", list(self.data.keys()))
+
+        print("Missing sources:", [
+            k for k in SOURCES if k not in self.data
+        ])
+
+        print("Source ages:", {
+            k: round(now - self.arrivals[k], 3)
+            if k in self.arrivals else None
+            for k in SOURCES
+        })
+
+        if len(self.arrivals) == len(SOURCES):
+            times = [self.arrivals[k] for k in SOURCES]
+            print("Timestamp spread:", round(max(times) - min(times), 3))
+
+        print("Gripper states:", self.gripper_states)
+        print("============================================")
+
+        raise RuntimeError(
+            "No new, suitably synchronized camera + joint observations"
+        )
 
     def send_targets(self, q12_rad):
         q = np.asarray(q12_rad, dtype=np.float64)
@@ -361,6 +386,18 @@ def main():
             arm_action = action[:12]
             gripper_action = action[12:14]
 
+            # Update requested gripper states from ACT predictions.
+
+            for arm, prediction in zip(
+                ("fr1", "fr2"), gripper_action
+            ):
+
+                if prediction >= 0.75:
+                    gripper_requested[arm] = True  # OPEN
+
+                elif prediction <= 0.25:
+                    gripper_requested[arm] = False  # CLOSE
+
             q_current = np.rad2deg(np.asarray(current_obs['joint_pos']))
             q_target = np.rad2deg(arm_action)
             delta = q_target - q_current
@@ -389,16 +426,6 @@ def main():
                 raise RuntimeError(
                     "ACT target exceeds validated displacement limit"
                 )
-
-            if any(node.gripper_states[a] is None for a in ("fr1", "fr2")):
-                raise RuntimeError("Initial gripper states are unavailable")
-
-            gripper_requested = {
-                arm: bool(node.gripper_states[arm])
-                for arm in ("fr1", "fr2")
-            }
-
-            gripper_sent = gripper_requested.copy()
 
             # =====================================================
             # SYNCHRONIZED DUAL-ARM ACT WAYPOINT EXECUTION
@@ -483,7 +510,6 @@ def main():
                                 arm,
                                 desired
                             )
-                            print(f"[DRY RUN] Would command {arm}: {desired}")
 
                             gripper_sent[arm] = desired
 
