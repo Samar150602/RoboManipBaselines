@@ -95,6 +95,21 @@ class Observations(Node):
                 lambda msg, arm=arm: self._status(arm, msg),
                 QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                            durability=DurabilityPolicy.TRANSIENT_LOCAL)))
+        self.gripper_cmd_pubs = {
+            "fr1": self.create_publisher(
+                Bool, "/fairino_1/gripper_command", 10
+            ),
+            "fr2": self.create_publisher(
+                Bool, "/fairino_2/gripper_command", 10
+            )
+        }
+
+    def send_gripper_command(self, arm, open_flag):
+
+        msg = Bool()
+        msg.data = bool(open_flag)
+
+        self.gripper_cmd_pubs[arm].publish(msg)
 
     def _joint(self, key, msg):
         try:
@@ -197,8 +212,8 @@ def main():
     ap.add_argument('--hz', type=float, default=15.0)
     ap.add_argument('--max-duration', type=float, default=9.0)
     args = ap.parse_args()
-    if args.steps < 1 or not (1.0 <= args.hz <= 15.0) or not (0 < args.max_duration <= 10.0):
-        ap.error('Require steps>=1, 1<=hz<=15, 0<max-duration<=10s')
+    if args.steps < 1 or not (1.0 <= args.hz <= 15.0) or not (0 < args.max_duration <= 15.0):
+        ap.error('Require steps>=1, 1<=hz<=15, 0<max-duration<=15s')
     if args.device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable (use --device cpu)')
     device = torch.device(args.device)
