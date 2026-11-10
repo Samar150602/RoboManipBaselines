@@ -104,6 +104,29 @@ class Observations(Node):
             )
         }
 
+        self.gripper_states = {
+            "fr1": None,
+            "fr2": None,
+        }
+
+        self.gripper_state_subs = []
+
+        for arm, topic in (
+            ("fr1", "/fairino_1/gripper_state"),
+            ("fr2", "/fairino_2/gripper_state"),
+        ):
+            self.gripper_state_subs.append(
+                self.create_subscription(
+                    Bool,
+                    topic,
+                    lambda msg, a=arm: self._gripper_state(a, msg),
+                    10,
+                )
+            )
+
+    def _gripper_state(self, arm, msg):
+        self.gripper_states[arm] = float(msg.data)
+
     def send_gripper_command(self, arm, open_flag):
 
         msg = Bool()
@@ -148,8 +171,16 @@ class Observations(Node):
             return None
         if max(times) - min(times) > max_spread:
             return None
+        if any(v is None for v in self.gripper_states.values()):
+            return None
         q = np.concatenate((self.data['fr1'], self.data['fr2']))
-        obs = {'joint_pos': q.copy()}
+        obs = {
+            'joint_pos': q.copy(),
+            'gripper_state': np.array([
+                self.gripper_states['fr1'],
+                self.gripper_states['fr2'],
+            ], dtype=np.float64),
+        }
         info = {'rgb_images': {
             'front': self.data['front'].copy(),
             'hand': self.data['hand'].copy(),
@@ -195,7 +226,7 @@ def inference(policy, meta, device, obs, info):
     with torch.inference_mode():
         chunk_t = policy(q_t, rgb_t)
     chunk = chunk_t[0].detach().cpu().numpy()
-    if chunk.ndim != 2 or chunk.shape[1] != 12:
+    if chunk.ndim != 2 or chunk.shape[1] != 14:
         raise RuntimeError(f'Unexpected ACT output shape {chunk.shape}')
     result = np.asarray([denormalize_data(a, meta['action']) for a in chunk], dtype=np.float64)
     if result.shape != chunk.shape or not np.isfinite(result).all():
@@ -239,6 +270,15 @@ def main():
             print(f'{arm} delta:   ', np.round(q_proposed-q_now, 3))
         print('ACT chunk:', preview_chunk.shape)
         print('Bridge statuses:', node.statuses)
+        print("\n=== ACT GRIPPER PREDICTIONS ===")
+
+        for i, action in enumerate(preview_chunk):
+            g1, g2 = action[12:14]
+
+            print(
+                f"Action {i + 1:02d}: "
+                f"FR1={g1:.3f}, FR2={g2:.3f}"
+            )
         if not args.execute:
             print('\nPREVIEW ONLY. No servo targets or arm commands sent.')
             return
@@ -255,10 +295,20 @@ def main():
             return
         obs, info, seq = node.wait_observation(since=seq, timeout=4.0)
         fresh_chunk, fresh_q = inference(policy, meta, device, obs, info)
-        delta_preview = np.rad2deg(fresh_chunk[0] - preview_chunk[0])
+        delta_preview = np.rad2deg(
+            fresh_chunk[0, :12] - preview_chunk[0, :12]
+        )
         if np.max(np.abs(delta_preview)) > 1.0:
             raise RuntimeError('ACT first target changed >1 deg since preview; rerun preview')
-        print('Fresh ACT targets (12 deg):', np.round(np.rad2deg(fresh_chunk[0]), 3))
+        print(
+            'Fresh ACT joint targets (deg):',
+            np.round(np.rad2deg(fresh_chunk[0, :12]), 3)
+        )
+
+        print(
+            'Fresh ACT gripper predictions:',
+            np.round(fresh_chunk[0, 12:14], 3)
+        )
         # Ensure that if ARM publication partially succeeds we request STOP for both.
         armed = True
         node.arm_both()
@@ -279,6 +329,17 @@ def main():
         started = time.monotonic()
         next_tick = started
         action_chunk = fresh_chunk
+
+        if any(node.gripper_states[a] is None for a in ("fr1", "fr2")):
+            raise RuntimeError("Initial gripper states unavailable")
+
+        gripper_requested = {
+            arm: bool(node.gripper_states[arm])
+            for arm in ("fr1", "fr2")
+        }
+
+        gripper_sent = gripper_requested.copy()
+
         for step in range(args.steps):
             if time.monotonic() - started >= args.max_duration:
                 print('ACT session duration limit reached')
@@ -296,8 +357,12 @@ def main():
                 print(f'ACT inference step={step}: {latency:.1f} ms')
             index = step % chunk_len
             action = action_chunk[index]
+
+            arm_action = action[:12]
+            gripper_action = action[12:14]
+
             q_current = np.rad2deg(np.asarray(current_obs['joint_pos']))
-            q_target = np.rad2deg(action)
+            q_target = np.rad2deg(arm_action)
             delta = q_target - q_current
             print(f'step={step+1:03d} FR1={np.round(delta[:6], 2)} FR2={np.round(delta[6:], 2)}', flush=True)
             max_error = float(np.max(np.abs(delta)))
@@ -324,11 +389,22 @@ def main():
                 raise RuntimeError(
                     "ACT target exceeds validated displacement limit"
                 )
+
+            if any(node.gripper_states[a] is None for a in ("fr1", "fr2")):
+                raise RuntimeError("Initial gripper states are unavailable")
+
+            gripper_requested = {
+                arm: bool(node.gripper_states[arm])
+                for arm in ("fr1", "fr2")
+            }
+
+            gripper_sent = gripper_requested.copy()
+
             # =====================================================
             # SYNCHRONIZED DUAL-ARM ACT WAYPOINT EXECUTION
             # =====================================================
 
-            node.send_targets(action)
+            node.send_targets(arm_action)
 
             waypoint_start = time.monotonic()
             last_publish = waypoint_start
@@ -381,21 +457,59 @@ def main():
                 fr2_error = np.max(np.abs(error[6:]))
 
                 # Only advance when BOTH robots reached the waypoint.
-                if (
+                arms_reached = (
                     fr1_error <= REACH_TOL_DEG
                     and fr2_error <= REACH_TOL_DEG
-                ):
-                    print(
-                        f"Waypoint {step + 1} reached: "
-                        f"FR1 error={fr1_error:.3f}°, "
-                        f"FR2 error={fr2_error:.3f}°"
+                )
+
+                if arms_reached:
+
+                    # Command grippers only after BOTH arms
+                    # have reached the current ACT waypoint.
+
+                    for arm in ("fr1", "fr2"):
+
+                        desired = gripper_requested[arm]
+
+                        if gripper_sent[arm] != desired:
+
+                            print(
+                                f"ACT waypoint {step + 1}: "
+                                f"{arm} gripper -> "
+                                f"{'OPEN' if desired else 'CLOSE'}"
+                            )
+
+                            node.send_gripper_command(
+                                arm,
+                                desired
+                            )
+                            print(f"[DRY RUN] Would command {arm}: {desired}")
+
+                            gripper_sent[arm] = desired
+
+                    # Wait for both gripper states to match.
+                    grippers_reached = all(
+                        node.gripper_states[arm] is not None
+                        and bool(node.gripper_states[arm])
+                            == gripper_requested[arm]
+                        for arm in ("fr1", "fr2")
                     )
-                    break
+
+                    if grippers_reached:
+
+                        print(
+                            f"Waypoint {step + 1} reached: "
+                            f"FR1={fr1_error:.3f}°, "
+                            f"FR2={fr2_error:.3f}°, "
+                            f"grippers={node.gripper_states}"
+                        )
+
+                        break
 
                 # Keep sending the SAME target so the bridge's
                 # existing command watchdog does not expire.
                 if now - last_publish >= period:
-                    node.send_targets(action)
+                    node.send_targets(arm_action)
                     last_publish = now
 
                 # Never skip a waypoint because of timeout.
