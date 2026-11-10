@@ -466,6 +466,27 @@ def main():
                     age = now - node.arrivals.get(arm, 0.0)
 
                     if age > 0.30:
+
+                        now_debug = time.monotonic()
+
+                        print("\n========== FEEDBACK FAILURE ==========")
+
+                        for a in ("fr1", "fr2"):
+
+                            feedback_age = (
+                                now_debug - node.arrivals.get(a, 0.0)
+                            )
+
+                            print(
+                                f"{a}: "
+                                f"age={feedback_age:.3f}s, "
+                                f"seq={node.seq[a]}, "
+                                f"servo_status={node.statuses[a]}, "
+                                f"gripper={node.gripper_states[a]}"
+                            )
+
+                        print("======================================\n")
+
                         raise RuntimeError(
                             f"{arm} joint feedback stale: {age:.3f}s"
                         )
