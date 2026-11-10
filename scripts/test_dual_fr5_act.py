@@ -85,19 +85,19 @@ def load_policy(checkpoint, device):
     print("Device:", device)
 
     # Validate the exact model/data configuration.
-    if state_keys != ["measured_joint_pos"]:
+    if state_keys != ["measured_joint_pos", "measured_gripper_joint_pos"]:
         raise ValueError(
             f"Unexpected state keys: {state_keys}"
         )
 
-    if action_keys != ["command_joint_pos"]:
+    if action_keys != ["command_joint_pos", "command_gripper_joint_pos"]:
         raise ValueError(
             f"Unexpected action keys: {action_keys}"
         )
 
-    if state_dim != 12 or action_dim != 12:
+    if state_dim != 14 or action_dim != 14:
         raise ValueError(
-            f"Expected 12D state/action, got {state_dim}/{action_dim}"
+            f"Expected 14D state/action, got {state_dim}/{action_dim}"
         )
 
     if camera_names != ["front", "hand"]:
@@ -126,14 +126,14 @@ def load_policy(checkpoint, device):
 
 
 def prepare_state(obs, meta, device):
-    state = np.asarray(
-        obs["joint_pos"],
-        dtype=np.float64,
-    ).reshape(-1)
+    state = np.concatenate([
+        np.asarray(obs["joint_pos"], dtype=np.float64).reshape(-1),
+        np.asarray(obs["gripper_state"], dtype=np.float64).reshape(-1),
+    ])
 
-    if state.shape != (12,):
+    if state.shape != (14,):
         raise ValueError(
-            f"Expected 12 joint positions, got {state.shape}"
+            f"Expected 14D state, got {state.shape}"
         )
 
     if not np.all(np.isfinite(state)):
