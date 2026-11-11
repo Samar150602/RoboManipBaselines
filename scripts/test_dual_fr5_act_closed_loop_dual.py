@@ -7,6 +7,19 @@ reads live ROS observations and publishes 12 predicted joint targets in radians.
 Default is PREVIEW ONLY. --execute and explicit terminal confirmation are
 required to request real motion. This does NOT certify collision safety.
 """
+# ============================================================================
+# 1) DEPENDENCIES
+# argparse: command-line flags. json: ServoJ status decoding.
+# time: monotonic deadlines and latency. numpy: robot joint/image arrays.
+# rclpy: ROS 2 pub/sub and callbacks. torch: ACT neural-network inference.
+# IMPORTANT: This script is an *ACT client*, NOT the FAIRINO SDK controller.
+# The existing fairino_ctrl and ServoJ bridge processes own the SDK connection.
+# ============================================================================
+# =============================================================================
+# WARNING: the full-gripper execution path has previously caused ServoJ faults.
+# --execute is NOT recommended until the controller/stop issue is resolved.
+# For a motion-only baseline, use the separate *_MOTION_ONLY.py.
+# =============================================================================
 import argparse
 import json
 import sys
@@ -20,9 +33,21 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Bool, String
 
+# RMB training normalizes action vectors. At inference we must invert that
+# normalization before interpreting values as joint radians or gripper 0/1.
+# load_policy(), prepare_state(), and prepare_images() live in another file:
+# test_dual_fr5_act.py. This script still depends on that file at runtime.
 from robo_manip_baselines.common import denormalize_data
 from test_dual_fr5_act import load_policy, prepare_state, prepare_images
 
+# ============================================================================
+# 2) ROS TOPIC MAPPING
+# Bridge topics are separated per FR5. Do NOT swap FR1/FR2 ordering: the
+# policy's first six joints belong to FR1, next six belong to FR2.
+# SOURCES contains the four *continuously updated* streams that need fresh
+# data: two arm joint arrays and two RGB images. Gripper states are tracked
+# separately because their ROS update cadence differs.
+# ============================================================================
 PREFIXES = {'fr1': '/fairino_1/act_servoj', 'fr2': '/fairino_2/act_servoj'}
 SOURCES = {
     'fr1': '/fairino_1/joint_states',
@@ -32,10 +57,17 @@ SOURCES = {
 }
 
 
+# ============================================================================
+# 3) INPUT VALIDATION / IMAGE DECODING
+# JointState messages may use arbitrary name ordering, so reorder explicitly
+# to [joint_1,...,joint_6] rather than trusting msg.position order.
+# Inputs stay in RADIANS for ACT and the ROS ServoJ bridge.
+# ============================================================================
 def joint_rad(msg):
     names = [f'joint_{n}' for n in range(1, 7)]
     if len(msg.name) != len(set(msg.name)) or len(msg.position) != len(msg.name):
         raise ValueError('Duplicate or mismatched joint names/positions')
+    # Map each incoming joint name to its measured position before sorting.
     mapping = dict(zip(msg.name, msg.position))
     if not all(name in mapping for name in names):
         raise ValueError(f'Joint names must include {names}')
@@ -45,11 +77,15 @@ def joint_rad(msg):
     return q
 
 
+# Converts a ROS sensor_msgs/Image byte buffer into a H x W x 3 RGB array.
+# The step field may include row padding, so we trim it correctly. If the
+# publisher sends BGR, reverse channels to obtain RGB for ACT.
 def image_rgb(msg):
     if msg.encoding not in ('rgb8', 'bgr8'):
         raise ValueError(f'Expected rgb8/bgr8, got {msg.encoding!r}')
     if msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * 3:
         raise ValueError('Invalid image dimensions/stride')
+    # frombuffer avoids copying the raw ROS message before reshaping.
     raw = np.frombuffer(msg.data, dtype=np.uint8)
     expected = msg.height * msg.step
     if raw.size != expected:
@@ -61,14 +97,25 @@ def image_rgb(msg):
     return rgb.copy()
 
 
+# ============================================================================
+# 4) ROS NODE: OBSERVATIONS + COMMAND INTERFACES
+# One ROS node subscribes to joint feedback/cameras/gripper feedback and
+# publishes requested arm/gripper commands through the existing controllers.
+# It does not instantiate a FAIRINO robot RPC client.
+# ============================================================================
 class Observations(Node):
     def __init__(self):
         super().__init__('act_dual_fr5_live_client')
+        # Latest per-source data. arrivals stores monotonic *arrival times*, not
+        # camera hardware timestamps. seq counts received messages per source;
+        # wait_observation(since=...) can therefore require a truly new sample.
         self.data = {}
         self.arrivals = {}
         self.seq = {k: 0 for k in SOURCES}
         self.statuses = {'fr1': None, 'fr2': None}
         self.status_at = {'fr1': 0.0, 'fr2': 0.0}
+        # BEST_EFFORT + depth 1 minimizes queued old sensor readings (common for
+        # high-frequency cameras and joint streams). It can drop packets if busy.
         qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -76,12 +123,18 @@ class Observations(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.subscribers = []
+        # Register both six-joint state subscriptions; lambda k=key binds each
+        # arm name now (otherwise late binding would point both to FR2).
         for key in ('fr1', 'fr2'):
             self.subscribers.append(self.create_subscription(
                 JointState, SOURCES[key], lambda msg, k=key: self._joint(k, msg), qos))
+        # Register the front and hand RGB camera streams independently.
         for key in ('front', 'hand'):
             self.subscribers.append(self.create_subscription(
                 Image, SOURCES[key], lambda msg, k=key: self._image(k, msg), qos))
+        # ServoJ bridge interface per arm: /target contains JointState positions
+        # (radians), /arm begins the bounded session, /stop requests termination.
+        # /status is retained by ROS (TRANSIENT_LOCAL), so it can sometimes be stale.
         self.target_pubs = {}
         self.arm_pubs = {}
         self.stop_pubs = {}
@@ -95,6 +148,10 @@ class Observations(Node):
                 lambda msg, arm=arm: self._status(arm, msg),
                 QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                            durability=DurabilityPolicy.TRANSIENT_LOCAL)))
+        # Gripper Bool command interface (True=OPEN, False=CLOSE). Controllers
+        # translate these topics into digital-output SDK commands (SetDO/SetD0).
+        # WARNING: in the FULL version, these commands previously caused faults
+        # while ServoJ was running. Do not treat this as a validated live path.
         self.gripper_cmd_pubs = {
             "fr1": self.create_publisher(
                 Bool, "/fairino_1/gripper_command", 10
@@ -104,6 +161,9 @@ class Observations(Node):
             )
         }
 
+        # Latest gripper reports. The initial value None means no report received.
+        # In this setup, these generally reflect *commanded* state, not verified
+        # physical jaw contact/position.
         self.gripper_states = {
             "fr1": None,
             "fr2": None,
@@ -124,9 +184,12 @@ class Observations(Node):
                 )
             )
 
+    # Feedback handler: cache OPEN=1.0 or CLOSE=0.0 for 14D ACT observations.
     def _gripper_state(self, arm, msg):
         self.gripper_states[arm] = float(msg.data)
 
+    # Publish a command only; ROS publish() does not prove hardware actuation.
+    # The receiving fairino_ctrl node makes the actual SDK SetDO call.
     def send_gripper_command(self, arm, open_flag):
 
         msg = Bool()
@@ -134,6 +197,8 @@ class Observations(Node):
 
         self.gripper_cmd_pubs[arm].publish(msg)
 
+    # On every joint-state message, validate and cache the six angles plus a
+    # monotonic arrival timestamp. Invalid feedback is logged and not accepted.
     def _joint(self, key, msg):
         try:
             self.data[key] = joint_rad(msg)
@@ -142,6 +207,7 @@ class Observations(Node):
         except Exception as exc:
             self.get_logger().error(f'{key} invalid joint feedback: {exc}')
 
+    # On every RGB image message, decode and cache the array and arrival time.
     def _image(self, key, msg):
         try:
             self.data[key] = image_rgb(msg)
@@ -150,6 +216,8 @@ class Observations(Node):
         except Exception as exc:
             self.get_logger().error(f'{key} camera frame invalid: {exc}')
 
+    # Decode the bridge's JSON status string. This status is informational and
+    # may be retained/stale; it is NOT a safety-rated stop confirmation.
     def _status(self, arm, msg):
         try:
             self.statuses[arm] = json.loads(msg.data)
@@ -158,21 +226,36 @@ class Observations(Node):
         except (ValueError, TypeError):
             self.get_logger().error(f'Malformed {arm} bridge status: {msg.data}')
 
+    # ============================================================================
+    # 5) BUILD ONE SYNCHRONIZED OBSERVATION
+    # Reject snapshots unless all four live sources exist, have fresh messages,
+    # arrived within max_age=0.30 s, and have arrival spread <=0.12 s.
+    # Then combine 12 measured joint angles and 2 gripper states into 14D.
+    # The separate image dict contains both RGB frames for the visual encoder.
+    # Note: this uses ROS receipt times, not hardware timestamp synchronization.
+    # ============================================================================
     def snapshot(self, since=None, max_age=0.30, max_spread=0.12):
         if len(self.data) != len(SOURCES):
             return None
+        # Require each live stream to advance beyond the previous snapshot.
         if since is not None and any(self.seq[k] <= since[k] for k in SOURCES):
             return None
+        # For diagnostic and deadline logic, use monotonic time so system clock
+        # changes do not move deadlines backward. (Other uses follow below.)
         now = time.monotonic()
         times = list(self.arrivals.values())
         if len(times) != len(SOURCES):
             return None
         if max(now - t for t in times) > max_age:
             return None
+        # Reject if the four latest arrivals are too far apart in receive time.
         if max(times) - min(times) > max_spread:
             return None
+        # Initial gripper reports are required even for PREVIEW: the model expects
+        # 14 inputs. Periodic state publication avoids startup None values.
         if any(v is None for v in self.gripper_states.values()):
             return None
+        # q order is [FR1 J1..J6, FR2 J1..J6], all radians.
         q = np.concatenate((self.data['fr1'], self.data['fr2']))
         obs = {
             'joint_pos': q.copy(),
@@ -187,6 +270,8 @@ class Observations(Node):
         }}
         return obs, info, dict(self.seq)
 
+    # Spin ROS callbacks until a valid snapshot exists, or report which of the
+    # joint/camera/gripper streams prevented a new synchronized observation.
     def wait_observation(self, since=None, timeout=6.0):
         deadline = time.monotonic() + timeout
         while rclpy.ok() and time.monotonic() < deadline:
@@ -221,6 +306,9 @@ class Observations(Node):
             "No new, suitably synchronized camera + joint observations"
         )
 
+    # Send the 12 *joint* components to the two ServoJ bridges. Each receives
+    # six radians via JointState; the bridge converts them to degrees and drives
+    # ServoJ through its existing safety checks and interpolation.
     def send_targets(self, q12_rad):
         q = np.asarray(q12_rad, dtype=np.float64)
         if q.shape != (12,) or not np.isfinite(q).all():
@@ -232,11 +320,16 @@ class Observations(Node):
             msg.position = q6.tolist()  # ROS values are RADIANS
             self.target_pubs[arm].publish(msg)
 
+    # Request both ServoJ bridge sessions to start. A Bool publish is a request;
+    # the main loop separately waits for each bridge's acknowledgement.
     def arm_both(self):
         msg = Bool(); msg.data = True
         for pub in self.arm_pubs.values():
             pub.publish(msg)
 
+    # Publish STOP several times to both bridges. IMPORTANT LIMITATION:
+    # repeated STOP publications do not themselves certify ServoMoveEnd success.
+    # This limitation matters because FR1 previously remained 'running'.
     def stop_both(self):
         msg = Bool(); msg.data = True
         for _ in range(5):
@@ -245,20 +338,38 @@ class Observations(Node):
             rclpy.spin_once(self, timeout_sec=0.04)
 
 
+# ============================================================================
+# 6) ACT INFERENCE: 14D STATE + TWO RGB CAMERAS -> 25 x 14 ACTION CHUNK
+# prepare_state(): [12 measured joint radians, FR1/FR2 gripper OPEN(1)/CLOSE(0)]
+# plus normalization using checkpoint metadata.
+# prepare_images(): stack front/hand images as model-ready tensors.
+# policy(): predict a whole future action chunk, not only one action.
+# denormalize_data(): convert neural-network outputs to meaningful units.
+# ============================================================================
 def inference(policy, meta, device, obs, info):
     q_t, measured = prepare_state(obs, meta, device)
     rgb_t = prepare_images(info, meta, device)
+    # Disable gradient recording: inference only, reducing GPU memory/overhead.
     with torch.inference_mode():
         chunk_t = policy(q_t, rgb_t)
     chunk = chunk_t[0].detach().cpu().numpy()
     if chunk.ndim != 2 or chunk.shape[1] != 14:
         raise RuntimeError(f'Unexpected ACT output shape {chunk.shape}')
+    # Each action row has [FR1 joints(6), FR2 joints(6), FR1 gripper, FR2 gripper].
+    # The gripper outputs are continuous regression values, not probabilities.
     result = np.asarray([denormalize_data(a, meta['action']) for a in chunk], dtype=np.float64)
     if result.shape != chunk.shape or not np.isfinite(result).all():
         raise RuntimeError('ACT prediction contained NaN/Inf')
     return result, measured
 
 
+# ============================================================================
+# 7) PROGRAM ENTRY POINT AND USER SAFETY GATES
+# Default: PREVIEW ONLY; absolutely no targets are sent unless --execute is
+# supplied AND the operator types the confirmation phrase.
+# --steps is the maximum number of waypoints; --hz controls repeat-publish
+# cadence (NOT waypoint progression speed); --max-duration caps session time.
+# ============================================================================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True)
@@ -273,18 +384,25 @@ def main():
     if args.device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA unavailable (use --device cpu)')
     device = torch.device(args.device)
+    # Load checkpoint + its adjacent model_meta_info.pkl; helper validates
+    # 14D state/action keys and loads weights onto CPU/GPU.
     policy, meta = load_policy(args.checkpoint, device)
     skip = int(meta['data']['skip'])
     chunk_len = int(meta['data']['chunk_size'])
     if skip < 1 or skip > chunk_len or chunk_len < 1:
         raise RuntimeError(f'Unexpected ACT skip/chunk size: {skip}/{chunk_len}')
+    # metadata skip is validated above but NOT used to skip actions here.
+    # The current rollout consumes all 25 predicted waypoints sequentially.
     print(f'ACT predicts {chunk_len} actions; this test uses all actions in each chunk')
     rclpy.init()
     node = Observations()
     armed = False
     try:
         print('\nWaiting for real cameras and BOTH FR5 joint-state topics...', flush=True)
+        # Wait for a valid live snapshot BEFORE asking ACT to predict motion.
         obs, info, seq = node.wait_observation(timeout=12.0)
+        # Compute model output once with real cameras/joints/gripper values, and
+        # show FR1/FR2 differences for operator inspection.
         preview_chunk, measured = inference(policy, meta, device, obs, info)
         print('\n=== LIVE ACT PREVIEW: BOTH FR5 ARMS ===')
         for arm, seg in (('FR5 #1', slice(0, 6)), ('FR5 #2', slice(6, 12))):
@@ -297,6 +415,8 @@ def main():
         print('Bridge statuses:', node.statuses)
         print("\n=== ACT GRIPPER PREDICTIONS ===")
 
+        # Print the two gripper outputs for all 25 actions. Typical OPEN output is
+        # around 1.0 (can be >1), CLOSE around 0.0 (can be negative).
         for i, action in enumerate(preview_chunk):
             g1, g2 = action[12:14]
 
@@ -304,9 +424,12 @@ def main():
                 f"Action {i + 1:02d}: "
                 f"FR1={g1:.3f}, FR2={g2:.3f}"
             )
+        # CRITICAL GATE: return without arming or publishing targets in PREVIEW.
         if not args.execute:
             print('\nPREVIEW ONLY. No servo targets or arm commands sent.')
             return
+        # Refuse to arm unless both bridges currently report IDLE. Because status
+        # uses TRANSIENT_LOCAL, verify actual stop/session state independently.
         if not all(isinstance(node.statuses[a], dict) and node.statuses[a].get('state') == 'idle'
                    for a in ('fr1', 'fr2')):
             raise RuntimeError(f'Both bridges must be IDLE; statuses={node.statuses}')
@@ -314,11 +437,15 @@ def main():
         print('no gripper command, and the SDK may block on socket retries.')
         print('Verify swept-path clearance, active independent physical E-stop,')
         print('no existing controller fault, and no competing robot motion source.')
+        # Second human-in-the-loop gate: physically inspect clearance, E-stop,
+        # configuration and first targets before allowing movement.
         confirm = input('Type START ACT BOTH ARMS to arm this bounded session: ').strip()
         if confirm != 'START ACT BOTH ARMS':
             print('Cancelled without motion.')
             return
         obs, info, seq = node.wait_observation(since=seq, timeout=4.0)
+        # Re-sample observations immediately before arming: reject if the first
+        # joint target changed by more than 1 degree since preview.
         fresh_chunk, fresh_q = inference(policy, meta, device, obs, info)
         delta_preview = np.rad2deg(
             fresh_chunk[0, :12] - preview_chunk[0, :12]
@@ -335,8 +462,12 @@ def main():
             np.round(fresh_chunk[0, 12:14], 3)
         )
         # Ensure that if ARM publication partially succeeds we request STOP for both.
+        # Set BEFORE publishing ARM, so finally tries to send STOP even if only one
+        # arm accepts the request or the acknowledgement phase fails.
         armed = True
         node.arm_both()
+        # Wait (up to 1.5 s) for both bridge sessions to report armed/running.
+        # Refuse to proceed on a fault, disabled bridge, or missing acknowledgement.
         deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=0.02)
@@ -347,17 +478,29 @@ def main():
                 raise RuntimeError(f'A bridge refused to arm: {node.statuses}')
         else:
             raise RuntimeError(f'No ARM acknowledgment from both bridges: {node.statuses}')
+        # ============================================================================
+        # 8) WAYPOINT PACING (NOT FIXED-RATE TRAJECTORY PLAYBACK)
+        # Each predicted joint target is held until BOTH arms are within 0.75 deg.
+        # The same target is republished at --hz to keep bridge watchdogs satisfied.
+        # This changes the ACT chunk's temporal spacing relative to demonstrations;
+        # --hz is the command republish frequency, NOT the ACT step rate.
+        # ============================================================================
         period = 1.0 / args.hz
         # Both arms must reach each ACT waypoint before advancing.
+        # Maximum joint error allowed for waypoint completion on either arm.
         REACH_TOL_DEG = 0.75
+        # Abort a waypoint instead of silently skipping it if the arms cannot reach.
         WAYPOINT_TIMEOUT_S = 3.0
         started = time.monotonic()
         next_tick = started
+        # Begin with the freshly preview-checked predicted chunk.
         action_chunk = fresh_chunk
 
         if any(node.gripper_states[a] is None for a in ("fr1", "fr2")):
             raise RuntimeError("Initial gripper states unavailable")
 
+        # Track previous gripper choice across waypoints: do not repeatedly send a
+        # CLOSE/OPEN command when predictions continue to request the same state.
         gripper_requested = {
             arm: bool(node.gripper_states[arm])
             for arm in ("fr1", "fr2")
@@ -365,16 +508,25 @@ def main():
 
         gripper_sent = gripper_requested.copy()
 
+        # ============================================================================
+        # 9) MAIN CLOSED-LOOP ACT EXECUTION
+        # Consume each model action in order. After all 25 have been used, obtain
+        # fresh joint+camera+gripper inputs and infer the next 25-action chunk.
+        # ============================================================================
         for step in range(args.steps):
             if time.monotonic() - started >= args.max_duration:
                 print('ACT session duration limit reached')
                 break
             # The first action was explicitly previewed; after this, reobserve.
+            # First target comes from the freshly checked observation; subsequent
+            # targets use a new validated ROS observation after the previous waypoint.
             if step == 0:
                 current_obs, current_info, current_seq = obs, info, seq
             else:
                 current_obs, current_info, current_seq = node.wait_observation(since=seq, timeout=0.30)
                 seq = current_seq
+            # At 25/50/75... steps, re-infer from the newest observation.
+            # This is chunked receding-horizon prediction, not temporal ensembling.
             if step > 0 and step % chunk_len == 0:
                 t0 = time.perf_counter()
                 action_chunk, _ = inference(policy, meta, device, current_obs, current_info)
@@ -383,11 +535,15 @@ def main():
             index = step % chunk_len
             action = action_chunk[index]
 
+            # Split the 14D action: six FR1 radians, six FR2 radians, and two
+            # continuous gripper predictions. Never pass all 14 to send_targets().
             arm_action = action[:12]
             gripper_action = action[12:14]
 
             # Update requested gripper states from ACT predictions.
 
+            # Gripper hysteresis: >=0.75 selects OPEN; <=0.25 selects CLOSE;
+            # between thresholds, keep the previous choice to limit oscillation.
             for arm, prediction in zip(
                 ("fr1", "fr2"), gripper_action
             ):
@@ -398,6 +554,8 @@ def main():
                 elif prediction <= 0.25:
                     gripper_requested[arm] = False  # CLOSE
 
+            # Convert *only* the 12 joint positions to degrees for diagnostics and
+            # displacement safety validation. Gripper values are not angles.
             q_current = np.rad2deg(np.asarray(current_obs['joint_pos']))
             q_target = np.rad2deg(arm_action)
             delta = q_target - q_current
@@ -407,6 +565,9 @@ def main():
     
             robot = 1 if worst_joint < 6 else 2
             joint = (worst_joint % 6) + 1
+            # Independent software guard: a model target >12 degrees from the last
+            # received joint snapshot is rejected BEFORE publishing that target.
+            # This is not inter-arm/self-collision checking.
             if max_error > 12.0:
                 print("\n==========ACT diagnostic===========")
                 print(f"ACT step: {step + 1}")
@@ -431,8 +592,14 @@ def main():
             # SYNCHRONIZED DUAL-ARM ACT WAYPOINT EXECUTION
             # =====================================================
 
+            # ============================================================================
+            # 10) EXECUTE ONE JOINT WAYPOINT
+            # Send the current target to BOTH bridges. Bridges handle the 125 Hz
+            # underlying SDK ServoJ commands; this Python script is a ROS client.
+            # ============================================================================
             node.send_targets(arm_action)
 
+            # Start a per-waypoint 3 s deadline; keep separate overall session deadline.
             waypoint_start = time.monotonic()
             last_publish = waypoint_start
             session_timed_out = False
@@ -440,17 +607,22 @@ def main():
             while rclpy.ok():
 
                 # Process feedback from BOTH robots.
+                # Pump ROS callbacks: refresh joint feedback, camera frames, gripper state,
+                # and status while the script is waiting for waypoint completion.
                 rclpy.spin_once(node, timeout_sec=0.01)
 
                 now = time.monotonic()
 
                 # Preserve the session duration limit.
+                # Stop the session if total allowed wall time has elapsed.
                 if now - started >= args.max_duration:
                     print("ACT session duration reached")
                     session_timed_out = True
                     break
 
                 # Stop if either ServoJ controller reports a problem.
+                # Abort on a bridge fault/stop. The status is a message from the bridge;
+                # check actual hardware if status was retained or is no longer updating.
                 for arm in ("fr1", "fr2"):
                     status = node.statuses[arm] or {}
 
@@ -462,9 +634,13 @@ def main():
                         )
 
                 # Require recent feedback from BOTH arms.
+                # The second per-arm loop checks last actual JOINT MESSAGE receipt time.
+                # The 0.30 s watchdog catches stalled ROS feedback. Keep it enabled.
                 for arm in ("fr1", "fr2"):
                     age = now - node.arrivals.get(arm, 0.0)
 
+                    # If feedback is late, log both arms' last received statuses before aborting;
+                    # do NOT increase this threshold merely to mask controller/SDK faults.
                     if age > 0.30:
 
                         now_debug = time.monotonic()
@@ -499,22 +675,29 @@ def main():
                     ))
                 )
 
+                # Compute signed joint errors in degrees for both robots.
                 error = q_target - measured
 
                 fr1_error = np.max(np.abs(error[:6]))
                 fr2_error = np.max(np.abs(error[6:]))
 
                 # Only advance when BOTH robots reached the waypoint.
+                # The largest joint error on FR1 AND on FR2 must each be <=0.75 degrees.
                 arms_reached = (
                     fr1_error <= REACH_TOL_DEG
                     and fr2_error <= REACH_TOL_DEG
                 )
 
+                # IMPORTANT: both arms at the current waypoint; gripper commands (if enabled)
+                # are evaluated only now, not concurrently with moving toward this target.
                 if arms_reached:
 
                     # Command grippers only after BOTH arms
                     # have reached the current ACT waypoint.
 
+                    # In the full-gripper version, publish OPEN/CLOSE on state transitions.
+                    # The previous hardware tests indicate this can interfere with ServoJ.
+                    # In the MOTION-ONLY copy, this call is replaced with a PRINT ONLY.
                     for arm in ("fr1", "fr2"):
 
                         desired = gripper_requested[arm]
@@ -527,6 +710,9 @@ def main():
                                 f"{'OPEN' if desired else 'CLOSE'}"
                             )
 
+                            # !! KNOWN RISK in FULL version !! Existing tests triggered feedback faults
+                            # when digital-output gripper commands were sent while ServoJ was active.
+                            # Use MOTION_ONLY for robot trajectory baseline until integration is fixed.
                             node.send_gripper_command(
                                 arm,
                                 desired
@@ -535,6 +721,9 @@ def main():
                             gripper_sent[arm] = desired
 
                     # Wait for both gripper states to match.
+                    # Only advance if the gripper state publisher matches requested values.
+                    # It may reflect the requested DO command, not actual mechanical completion.
+                    # MOTION_ONLY instead sets grippers_reached=True to avoid waiting forever.
                     grippers_reached = all(
                         node.gripper_states[arm] is not None
                         and bool(node.gripper_states[arm])
@@ -542,6 +731,8 @@ def main():
                         for arm in ("fr1", "fr2")
                     )
 
+                    # Exit the inner while-loop and advance to the next ACT action only when
+                    # BOTH arm target errors and the chosen gripper-completion condition pass.
                     if grippers_reached:
 
                         print(
@@ -555,11 +746,14 @@ def main():
 
                 # Keep sending the SAME target so the bridge's
                 # existing command watchdog does not expire.
+                # Keep sending the SAME joint target while waiting; do NOT advance the
+                # policy index on every 15 Hz tick, because arms might be lagging.
                 if now - last_publish >= period:
                     node.send_targets(arm_action)
                     last_publish = now
 
                 # Never skip a waypoint because of timeout.
+                # Abort on late waypoint completion instead of silently skipping commands.
                 if now - waypoint_start >= WAYPOINT_TIMEOUT_S:
                     raise RuntimeError(
                         f"Waypoint {step + 1} timeout: "
@@ -569,8 +763,17 @@ def main():
 
             if session_timed_out:
                 break
+        # This print means the loop returned, not that both bridges confirmed STOP.
         print('ACT bounded session finished; requesting servo end.')
+    # ============================================================================
+    # 11) CLEANUP ON SUCCESS, ERROR, OR INTERRUPT
+    # Even exceptions should trigger the dual STOP request if ARM was attempted.
+    # STOP publication is not a physical E-stop and a reported 'fault' is NOT
+    # equivalent to verified ServoMoveEnd success. Previous FR1 runs stayed
+    # 'running' here: confirm both sessions ended before any new test.
+    # ============================================================================
     finally:
+        # Request both bridges to stop, then process status callbacks for up to 3 s.
         if armed:
             print('Sending /stop and awaiting bridge status...')
             node.stop_both()
@@ -582,6 +785,7 @@ def main():
             print('Final bridge statuses:', node.statuses)
             if not all((node.statuses[a] or {}).get('state') in ('stopped', 'fault') for a in ('fr1', 'fr2')):
                 print('WARNING: BOTH servo sessions have not been confirmed stopped.')
+        # Release ROS resources even when an exception occurred.
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
