@@ -169,6 +169,13 @@ class Observations(Node):
             "fr2": None,
         }
 
+        # Record the arrival time of each gripper-state message.
+        # This lets us distinguish a new report from an older one.
+        self.gripper_state_at = {
+            "fr1": 0.0,
+            "fr2": 0.0,
+        }
+
         self.gripper_state_subs = []
 
         for arm, topic in (
@@ -187,6 +194,7 @@ class Observations(Node):
     # Feedback handler: cache OPEN=1.0 or CLOSE=0.0 for 14D ACT observations.
     def _gripper_state(self, arm, msg):
         self.gripper_states[arm] = float(msg.data)
+        self.gripper_state_at[arm] = time.monotonic()
 
     # Publish a command only; ROS publish() does not prove hardware actuation.
     # The receiving fairino_ctrl node makes the actual SDK SetDO call.
@@ -362,6 +370,125 @@ def inference(policy, meta, device, obs, info):
         raise RuntimeError('ACT prediction contained NaN/Inf')
     return result, measured
 
+# ============================================================
+# SERVOJ STOP VERIFICATION
+# ============================================================
+
+def request_verified_stop(node, session_ids, timeout_s=5.0):
+
+    # Record the time before requesting STOP.
+    sent_at = time.monotonic()
+
+    # Send one STOP request to each ServoJ bridge.
+    msg = Bool()
+    msg.data = True
+
+    for pub in node.stop_pubs.values():
+        pub.publish(msg)
+
+    confirmed = set()
+    deadline = sent_at + timeout_s
+
+    while rclpy.ok() and time.monotonic() < deadline:
+
+        # Process incoming bridge status messages.
+        rclpy.spin_once(node, timeout_sec=0.02)
+
+        for arm in ("fr1", "fr2"):
+
+            if arm in confirmed:
+                continue
+
+            # Ignore statuses received before the STOP request.
+            if node.status_at[arm] <= sent_at:
+                continue
+
+            status = node.statuses[arm] or {}
+
+            # Ignore status messages belonging to an older session.
+            if status.get("session_id") != session_ids.get(arm):
+                continue
+
+            state = status.get("state")
+
+            # Do not continue after a controller failure.
+            if state in ("fault", "disabled", "busy"):
+                raise RuntimeError(
+                    f"{arm} failed while stopping: {status}"
+                )
+
+            if state == "stopped":
+
+                # A STOP message is not sufficient.
+                # The bridge must confirm successful ServoMoveEnd().
+                if status.get("servo_end_ok") is not True:
+                    raise RuntimeError(
+                        f"{arm} ServoMoveEnd not verified: {status}"
+                    )
+
+                confirmed.add(arm)
+
+        if len(confirmed) == 2:
+
+            print(
+                "Both ServoMoveEnd calls acknowledged successfully."
+            )
+
+            return
+
+    raise RuntimeError(
+        f"STOP not verified on both arms: {node.statuses}"
+    )
+
+
+# ============================================================
+# GRIPPER COMMANDS — ONLY AFTER BOTH SERVO SESSIONS END
+# ============================================================
+
+def command_grippers_when_stopped(
+    node, requested, changed, timeout_s=3.0
+):
+
+    sent_at = time.monotonic()
+
+    # Only command grippers whose requested state changed.
+    for arm in changed:
+
+        desired = requested[arm]
+
+        print(
+            f"[GRIPPER] {arm}: "
+            f"{'OPEN' if desired else 'CLOSE'}"
+        )
+
+        node.send_gripper_command(arm, desired)
+
+    # Wait for new ROS commanded-state reports.
+    deadline = time.monotonic() + timeout_s
+
+    while rclpy.ok() and time.monotonic() < deadline:
+
+        rclpy.spin_once(node, timeout_sec=0.02)
+
+        reports_updated = all(
+            node.gripper_state_at[arm] > sent_at
+            and node.gripper_states[arm] is not None
+            and bool(node.gripper_states[arm]) == requested[arm]
+            for arm in changed
+        )
+
+        if reports_updated:
+
+            print(
+                "ROS gripper commanded-state updated. "
+                "Physical movement is not yet verified."
+            )
+
+            return
+
+    raise RuntimeError(
+        f"Gripper feedback timeout: {node.gripper_states}"
+    )
 
 # ============================================================================
 # 7) PROGRAM ENTRY POINT AND USER SAFETY GATES
@@ -396,7 +523,14 @@ def main():
     print(f'ACT predicts {chunk_len} actions; this test uses all actions in each chunk')
     rclpy.init()
     node = Observations()
+
     armed = False
+
+    # True only after BOTH ServoMoveEnd calls were verified.
+    servo_ended = False
+
+    # Identifies the ServoJ session started on each robot.
+    session_ids = {}
     try:
         print('\nWaiting for real cameras and BOTH FR5 joint-state topics...', flush=True)
         # Wait for a valid live snapshot BEFORE asking ACT to predict motion.
@@ -430,9 +564,22 @@ def main():
             return
         # Refuse to arm unless both bridges currently report IDLE. Because status
         # uses TRANSIENT_LOCAL, verify actual stop/session state independently.
-        if not all(isinstance(node.statuses[a], dict) and node.statuses[a].get('state') == 'idle'
-                   for a in ('fr1', 'fr2')):
-            raise RuntimeError(f'Both bridges must be IDLE; statuses={node.statuses}')
+        if not all(
+            isinstance(node.statuses[a], dict)
+            and node.statuses[a].get("state") == "idle"
+            and isinstance(node.statuses[a].get("session_id"), int)
+            for a in ("fr1", "fr2")
+        ):
+            raise RuntimeError(
+                "Both bridges must be IDLE and support "
+                f"session-aware status: {node.statuses}"
+            )
+
+        # The updated bridge increments its session ID on ARM.
+        session_ids = {
+            arm: node.statuses[arm]["session_id"] + 1
+            for arm in ("fr1", "fr2")
+        }
         print('\nWARNING: This is experimental physical ACT motion. No collision checking,')
         print('no gripper command, and the SDK may block on socket retries.')
         print('Verify swept-path clearance, active independent physical E-stop,')
@@ -465,17 +612,40 @@ def main():
         # Set BEFORE publishing ARM, so finally tries to send STOP even if only one
         # arm accepts the request or the acknowledgement phase fails.
         armed = True
+
+        # Require acknowledgements received after this ARM request.
+        arm_requested_at = time.monotonic()
+
         node.arm_both()
         # Wait (up to 1.5 s) for both bridge sessions to report armed/running.
         # Refuse to proceed on a fault, disabled bridge, or missing acknowledgement.
         deadline = time.monotonic() + 1.5
         while time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=0.02)
-            states = {a: (node.statuses[a] or {}).get('state') for a in ('fr1', 'fr2')}
-            if all(v in ('armed', 'running') for v in states.values()):
+            states = {
+                a: (node.statuses[a] or {}).get("state")
+                for a in ("fr1", "fr2")
+            }
+
+            if all(
+                node.status_at[a] > arm_requested_at
+                and (node.statuses[a] or {}).get("session_id") == session_ids[a]
+                and states[a] in ("armed", "running")
+                for a in ("fr1", "fr2")
+            ):
                 break
-            if any(v in ('fault', 'disabled', 'stopping', 'stopped') for v in states.values()):
-                raise RuntimeError(f'A bridge refused to arm: {node.statuses}')
+
+            if any(
+                node.status_at[a] > arm_requested_at
+                and (node.statuses[a] or {}).get("session_id") == session_ids[a]
+                and states[a] in (
+                    "fault", "disabled", "busy", "stopping", "stopped"
+                )
+                for a in ("fr1", "fr2")
+            ):
+                raise RuntimeError(
+                    f"A bridge refused to arm: {node.statuses}"
+                )
         else:
             raise RuntimeError(f'No ARM acknowledgment from both bridges: {node.statuses}')
         # ============================================================================
@@ -603,6 +773,7 @@ def main():
             waypoint_start = time.monotonic()
             last_publish = waypoint_start
             session_timed_out = False
+            pause_test_completed = False
 
             while rclpy.ok():
 
@@ -692,57 +863,66 @@ def main():
                 # are evaluated only now, not concurrently with moving toward this target.
                 if arms_reached:
 
-                    # Command grippers only after BOTH arms
-                    # have reached the current ACT waypoint.
+                    # Check which grippers need to change state.
+                    changed = [
+                        arm for arm in ("fr1", "fr2")
+                        if gripper_sent[arm] != gripper_requested[arm]
+                    ]
 
-                    # In the full-gripper version, publish OPEN/CLOSE on state transitions.
-                    # The previous hardware tests indicate this can interfere with ServoJ.
-                    # In the MOTION-ONLY copy, this call is replaced with a PRINT ONLY.
-                    for arm in ("fr1", "fr2"):
-
-                        desired = gripper_requested[arm]
-
-                        if gripper_sent[arm] != desired:
-
-                            print(
-                                f"ACT waypoint {step + 1}: "
-                                f"{arm} gripper -> "
-                                f"{'OPEN' if desired else 'CLOSE'}"
-                            )
-
-                            # !! KNOWN RISK in FULL version !! Existing tests triggered feedback faults
-                            # when digital-output gripper commands were sent while ServoJ was active.
-                            # Use MOTION_ONLY for robot trajectory baseline until integration is fixed.
-                            node.send_gripper_command(
-                                arm,
-                                desired
-                            )
-
-                            gripper_sent[arm] = desired
-
-                    # Wait for both gripper states to match.
-                    # Only advance if the gripper state publisher matches requested values.
-                    # It may reflect the requested DO command, not actual mechanical completion.
-                    # MOTION_ONLY instead sets grippers_reached=True to avoid waiting forever.
-                    grippers_reached = all(
-                        node.gripper_states[arm] is not None
-                        and bool(node.gripper_states[arm])
-                            == gripper_requested[arm]
-                        for arm in ("fr1", "fr2")
-                    )
-
-                    # Exit the inner while-loop and advance to the next ACT action only when
-                    # BOTH arm target errors and the chosen gripper-completion condition pass.
-                    if grippers_reached:
+                    if changed:
 
                         print(
-                            f"Waypoint {step + 1} reached: "
-                            f"FR1={fr1_error:.3f}°, "
-                            f"FR2={fr2_error:.3f}°, "
-                            f"grippers={node.gripper_states}"
+                            f"ACT waypoint {step + 1}: "
+                            f"gripper transition requested for {changed}"
                         )
 
+                        # STEP 1: Stop ServoJ on BOTH robots.
+                        # Do not command grippers until both stops are verified.
+                        request_verified_stop(
+                            node,
+                            session_ids,
+                            timeout_s=5.0
+                        )
+
+                        servo_ended = True
+
+                        # STEP 2: Now ServoJ is no longer running.
+                        # Execute only the requested gripper changes.
+                        command_grippers_when_stopped(
+                            node,
+                            gripper_requested,
+                            changed,
+                            timeout_s=3.0
+                        )
+
+                        # STEP 3: Update the last commanded gripper states.
+                        for arm in changed:
+                            gripper_sent[arm] = gripper_requested[arm]
+
+                        # STEP 4: First hardware experiment is pause-only.
+                        # We will enable restart after validating the bridge.
+                        print(
+                            "PAUSE-ONLY test completed. "
+                            "ServoJ will NOT restart automatically."
+                        )
+
+                        print(
+                            "Physically inspect both grippers "
+                            "and confirm robot status."
+                        )
+
+                        pause_test_completed = True
                         break
+
+                    # No gripper transition: proceed normally.
+                    print(
+                        f"Waypoint {step + 1} reached: "
+                        f"FR1={fr1_error:.3f}°, "
+                        f"FR2={fr2_error:.3f}°, "
+                        f"grippers={node.gripper_states}"
+                    )
+
+                    break
 
                 # Keep sending the SAME target so the bridge's
                 # existing command watchdog does not expire.
@@ -761,8 +941,9 @@ def main():
                         f"FR2 error={fr2_error:.2f}°"
                     )
 
-            if session_timed_out:
+            if session_timed_out or pause_test_completed:
                 break
+
         # This print means the loop returned, not that both bridges confirmed STOP.
         print('ACT bounded session finished; requesting servo end.')
     # ============================================================================
@@ -773,22 +954,48 @@ def main():
     # 'running' here: confirm both sessions ended before any new test.
     # ============================================================================
     finally:
-        # Request both bridges to stop, then process status callbacks for up to 3 s.
-        if armed:
-            print('Sending /stop and awaiting bridge status...')
-            node.stop_both()
-            end_deadline = time.monotonic() + 3.0
-            while time.monotonic() < end_deadline:
-                rclpy.spin_once(node, timeout_sec=0.08)
-                if all((node.statuses[a] or {}).get('state') in ('stopped', 'fault') for a in ('fr1', 'fr2')):
-                    break
-            print('Final bridge statuses:', node.statuses)
-            if not all((node.statuses[a] or {}).get('state') in ('stopped', 'fault') for a in ('fr1', 'fr2')):
-                print('WARNING: BOTH servo sessions have not been confirmed stopped.')
-        # Release ROS resources even when an exception occurred.
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+
+        # If ServoJ has not already been ended successfully,
+        # request STOP and verify both sessions.
+        try:
+
+            if armed and not servo_ended:
+
+                print(
+                    "Requesting STOP and verifying "
+                    "both ServoJ sessions..."
+                )
+
+                request_verified_stop(
+                    node,
+                    session_ids,
+                    timeout_s=5.0
+                )
+
+                servo_ended = True
+
+        except Exception as exc:
+
+            print(
+                f"CRITICAL: ServoJ shutdown NOT verified: {exc}"
+            )
+
+            print(
+                "Do not re-arm the robots. "
+                "Use the established controller safe-stop procedure."
+            )
+
+        finally:
+
+            print(
+                "Final bridge statuses:",
+                node.statuses
+            )
+
+            node.destroy_node()
+
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 if __name__ == '__main__':

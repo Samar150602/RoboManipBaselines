@@ -48,6 +48,24 @@ class ActServoJBridge:
         self._num_commands = 0
         self._fault_latched = False
 
+        # ============================================================
+        # ServoJ session tracking for pause/resume
+        # ============================================================
+
+        # Increases whenever a new ServoJ session is requested.
+        # Allows the ACT rollout to identify the correct session.
+        self._session_id = 0
+
+        # True only after ServoMoveEnd() returns SDK code 0.
+        self._servo_end_ok = False
+
+        # Serializes status messages published by ROS callbacks
+        # and the independent ServoJ worker thread.
+        self._status_lock = threading.Lock()
+
+        # Stores the last published status.
+        self._last_state = None
+
         q = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
                        reliability=ReliabilityPolicy.RELIABLE)
         self.status_pub = node.create_publisher(
@@ -74,12 +92,47 @@ class ActServoJBridge:
             return self._reserved or self._fault_latched
 
     def _status(self, state, reason):
-        payload = {'state': state, 'reason': str(reason),
-                   'ip': str(self.robot_ip), 'commands': self._num_commands}
-        msg = String()
-        msg.data = json.dumps(payload)
-        self.status_pub.publish(msg)
-        self.node.get_logger().info('ACT_SERVOJ ' + msg.data)
+
+        # Protect status publication across the ROS executor
+        # and the ServoJ worker thread.
+        with self._status_lock:
+
+            # Do not allow repeated or delayed STOP requests
+            # to overwrite a completed STOP or FAULT status.
+            if (
+                state == 'stopping'
+                and self._last_state in (
+                    'idle',
+                    'disabled',
+                    'stopped',
+                    'fault'
+                )
+            ):
+                return
+
+            self._last_state = state
+
+            payload = {
+                'state': state,
+                'reason': str(reason),
+                'ip': str(self.robot_ip),
+                'commands': self._num_commands,
+
+                # Identify the current ServoJ session.
+                'session_id': self._session_id,
+
+                # Acknowledgement from the actual SDK call.
+                'servo_end_ok': self._servo_end_ok,
+            }
+
+            msg = String()
+            msg.data = json.dumps(payload)
+
+            self.status_pub.publish(msg)
+
+            self.node.get_logger().info(
+                'ACT_SERVOJ ' + msg.data
+            )
 
     @staticmethod
     def _ordered(msg):
@@ -102,19 +155,30 @@ class ActServoJBridge:
             self._feedback_deg = joints
             self._feedback_at = time.monotonic()
 
+    def _fault_target(self, reason):
+
+        # Only active sessions can fail because of a target.
+        with self.lock:
+
+            if not self._reserved:
+                return
+
+            self._last_fault = str(reason)
+            self._fault_latched = True
+            self._stop.set()
+
+        self._status('fault', reason)
+
     def _on_target(self, msg):
         joints = self._ordered(msg)
         if joints is None:
-            if self.reserved:
-                self._stop.set()
-                self._status('fault', 'Malformed joint target')
+            self._fault_target('Malformed joint target')
             return
         # Reject delayed ROS messages, rather than replaying an old queued target.
         stamp_ns = int(msg.header.stamp.sec) * 1000000000 + int(msg.header.stamp.nanosec)
         now_ns = self.node.get_clock().now().nanoseconds
         if stamp_ns <= 0 or not (0 <= now_ns - stamp_ns <= 250000000):
-            self._stop.set()
-            self._status('fault', 'Stale or future target timestamp')
+            self._fault_target('Stale or future target timestamp')
             return
         with self.lock:
             if not self._reserved:
@@ -130,18 +194,50 @@ class ActServoJBridge:
             self._status('disabled', 'enable_act_servoj=False')
             return
         with self.lock:
-            if self._reserved or self._fault_latched:
-                # Do not rearm after an uncertain previous servo failure.
-                busy = True
-            else:
-                busy = False
+
+            # Prevent a new session while the previous worker
+            # is still running or completing its cleanup.
+            previous_worker_alive = (
+                self._thread is not None
+                and self._thread.is_alive()
+            )
+
+            busy = (
+                self._reserved
+                or self._fault_latched
+                or previous_worker_alive
+            )
+
             if not busy:
+
                 self._reserved = True
+
+                # A new ServoJ session begins here.
+                self._session_id += 1
+
+                # The new session has not been ended yet.
+                self._servo_end_ok = False
+
+                # Clear old diagnostics from a successful session.
+                self._last_fault = ''
+
+                # Discard targets from the previous session.
                 self._target_deg = None
                 self._target_at = 0.0
+
+                # Reset the worker stop request.
                 self._stop.clear()
+
+                # Reset the command counter.
                 self._num_commands = 0
-                thread = threading.Thread(target=self._worker, name='fr5-servoj-worker', daemon=True)
+
+                # Create a new ServoJ worker.
+                thread = threading.Thread(
+                    target=self._worker,
+                    name='fr5-servoj-worker',
+                    daemon=True
+                )
+
                 self._thread = thread
         if busy:
             self._status('fault' if self._fault_latched else 'busy', 'ServoJ active or previous fault latched; restart only after investigating')
@@ -154,8 +250,19 @@ class ActServoJBridge:
             self.stop('ROS operator stop requested')
 
     def stop(self, reason='stop requested'):
-        self._stop.set()
-        self._status('stopping', reason)
+
+        # Check whether a ServoJ session is reserved.
+        with self.lock:
+
+            active = self._reserved
+
+            if active:
+                self._stop.set()
+
+        # Publish STOPPING only for an active session.
+        # Do not overwrite an existing STOPPED status.
+        if active:
+            self._status('stopping', reason)
 
     def shutdown(self):
         self.stop('controller shutdown')
@@ -229,6 +336,12 @@ class ActServoJBridge:
                 raise RuntimeError('Initial ACT target violates joint soft-limit margin')
             if np.max(np.abs(target - start)) > self.MAX_TARGET_GAP_DEG:
                 raise RuntimeError('Initial ACT target too far from current joints')
+
+            # Do not begin a ServoJ session if STOP has already
+            # been requested during initial validation.
+            if self._stop.is_set():
+                return
+
             ret = self.robot.ServoMoveStart()
             if ret != 0:
                 raise RuntimeError(f'ServoMoveStart returned {ret}')
@@ -289,21 +402,80 @@ class ActServoJBridge:
             self._last_fault = str(exc)
             self._status('fault', str(exc))
         finally:
+
+            # ====================================================
+            # END THE HARDWARE SERVO SESSION
+            # ====================================================
+
             if servo_started:
-                # ServoMoveEnd requests normal servo-session exit; NOT safety-rated stopping.
+
                 try:
+
+                    # Ask FAIRINO SDK to end the ServoJ session.
                     end_code = self.robot.ServoMoveEnd()
-                    self.node.get_logger().warning(f'ServoMoveEnd returned {end_code}')
-                    if end_code != 0:
+
+                    self.node.get_logger().warning(
+                        f'ServoMoveEnd returned {end_code}'
+                    )
+
+                    if end_code == 0:
+
+                        # The SDK acknowledged successful session exit.
+                        self._servo_end_ok = True
+
+                    else:
+
+                        # SDK did not confirm successful session exit.
                         failed = True
+
+                        extra = f'ServoMoveEnd returned {end_code}'
+
+                        self._last_fault = (
+                            f'{self._last_fault}; {extra}'
+                            if self._last_fault
+                            else extra
+                        )
+
                 except Exception as exc:
+
                     failed = True
-                    self.node.get_logger().error(f'ServoMoveEnd FAILED: {exc}')
+
+                    extra = f'ServoMoveEnd exception: {exc}'
+
+                    self._last_fault = (
+                        f'{self._last_fault}; {extra}'
+                        if self._last_fault
+                        else extra
+                    )
+
+                    self.node.get_logger().error(
+                        f'ServoMoveEnd FAILED: {exc}'
+                    )
+
+            # ====================================================
+            # RELEASE THE SESSION RESERVATION
+            # ====================================================
+
             with self.lock:
+
+                # Include faults detected by ROS target callbacks.
+                failed = failed or self._fault_latched
+
                 if failed:
                     self._fault_latched = True
+
                 self._reserved = False
+
+                # Old ACT targets must not survive into the
+                # next ServoJ session.
                 self._target_deg = None
                 self._target_at = 0.0
-            self._status('fault' if failed else 'stopped',
-                         self._last_fault if failed else 'Servo session ended')
+
+            # ====================================================
+            # PUBLISH FINAL SESSION RESULT
+            # ====================================================
+
+            self._status(
+                'fault' if failed else 'stopped',
+                self._last_fault if failed else 'Servo session ended'
+            )
